@@ -1,0 +1,9 @@
+/dist/
+/slidebolt
+/.testlogs/
+*.tmp
+*.log
+.env
+.env.*
+!.env.example
+
