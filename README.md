@@ -24,10 +24,12 @@ slidebolt stop --dir ./demo
 slidebolt destroy --dir ./demo
 ```
 
-Plugins may declare system-owned executable or file requirements. Quickstart
-checks those requirements before writing the installation and never invokes a
-package manager or `sudo`. Install the requested package yourself, or provide a
-non-standard executable explicitly:
+Components may declare system-owned executable or file requirements. Quickstart
+checks the resolved dependency graph before writing the installation and never
+invokes a package manager or `sudo`. For example, selecting HDHomeRun pulls in
+the hidden media service, which owns the shared FFmpeg and FFprobe requirements.
+Install the requested package yourself, or provide non-standard executables
+explicitly:
 
 ```bash
 slidebolt build --dir ./tv-demo --plugin plugin-hdhomerun \
