@@ -33,11 +33,6 @@ type Catalog struct {
 	Release       string              `json:"release"`
 	Manager       map[string]Artifact `json:"manager"`
 	Components    []Component         `json:"components"`
-	Resources     map[string]Resource `json:"resources,omitempty"`
-}
-
-type Resource struct {
-	Artifacts map[string]Artifact `json:"artifacts"`
 }
 
 func Load(source string) (Catalog, error) {
@@ -72,7 +67,7 @@ func Load(source string) (Catalog, error) {
 }
 
 func (c Catalog) Validate() error {
-	if c.SchemaVersion != 1 || c.Release == "" {
+	if c.SchemaVersion != 2 || c.Release == "" {
 		return fmt.Errorf("catalog: invalid schema or release")
 	}
 	seen := map[string]struct{}{}
@@ -105,21 +100,6 @@ func (c Catalog) Validate() error {
 		for _, dependency := range component.DependsOn {
 			if _, ok := seen[dependency]; !ok {
 				return fmt.Errorf("catalog: %s depends on missing %s", component.ID, dependency)
-			}
-		}
-		for _, tool := range component.Setup.Tools {
-			if _, ok := c.Resources[tool.ID]; !ok {
-				return fmt.Errorf("catalog: %s requires missing resource %s", component.ID, tool.ID)
-			}
-		}
-	}
-	for id, resource := range c.Resources {
-		if id == "" || len(resource.Artifacts) == 0 {
-			return fmt.Errorf("catalog: incomplete resource %q", id)
-		}
-		for platform, artifact := range resource.Artifacts {
-			if err := validateArtifact(platform, artifact); err != nil {
-				return fmt.Errorf("catalog: resource %s: %w", id, err)
 			}
 		}
 	}

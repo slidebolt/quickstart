@@ -93,19 +93,27 @@ func (a App) build(ctx context.Context, args []string) error {
 	fs.SetOutput(a.Err)
 	dir := fs.String("dir", "", "installation directory (default: new temporary directory)")
 	catalogURL := fs.String("catalog", catalog.DefaultURL, "released quickstart catalog URL")
-	var plugins, settings repeated
+	var plugins, settings, tools repeated
 	fs.Var(&plugins, "plugin", "selectable plugin ID (repeatable)")
 	fs.Var(&settings, "set", "component.field=value (repeatable; secrets are rejected)")
+	fs.Var(&tools, "tool", "system tool override, id=/absolute/path (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *dir == "" {
+	automaticDirectory := *dir == ""
+	if automaticDirectory {
 		created, err := os.MkdirTemp("", "slidebolt-quickstart-")
 		if err != nil {
 			return err
 		}
 		*dir = created
 	}
+	removeAutomaticDirectory := automaticDirectory
+	defer func() {
+		if removeAutomaticDirectory {
+			_ = os.RemoveAll(*dir)
+		}
+	}()
 	cat, err := catalog.Load(*catalogURL)
 	if err != nil {
 		return err
@@ -114,12 +122,33 @@ func (a App) build(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	builder := install.Builder{Root: *dir, CatalogURL: *catalogURL, Catalog: cat, Plugins: plugins, Values: values, Stdout: a.Out}
+	toolOverrides, err := parseToolOverrides(tools)
+	if err != nil {
+		return err
+	}
+	builder := install.Builder{Root: *dir, CatalogURL: *catalogURL, Catalog: cat, Plugins: plugins, Values: values, Tools: toolOverrides, Stdout: a.Out}
 	if err := builder.Build(ctx); err != nil {
 		return err
 	}
+	removeAutomaticDirectory = false
 	fmt.Fprintf(a.Out, "built %s in %s\n", cat.Release, *dir)
 	return nil
+}
+
+func parseToolOverrides(raw []string) (map[string]string, error) {
+	result := map[string]string{}
+	for _, item := range raw {
+		id, path, ok := strings.Cut(item, "=")
+		id, path = strings.TrimSpace(id), strings.TrimSpace(path)
+		if !ok || id == "" || path == "" {
+			return nil, fmt.Errorf("invalid --tool %q; want id=/path/to/executable", item)
+		}
+		if _, exists := result[id]; exists {
+			return nil, fmt.Errorf("duplicate --tool %q", id)
+		}
+		result[id] = path
+	}
+	return result, nil
 }
 
 func parseSettings(cat catalog.Catalog, raw []string) (map[string]map[string]string, error) {
@@ -335,6 +364,7 @@ func (a App) interactive(ctx context.Context) error {
 	fmt.Fprint(a.Out, "Installation directory [temporary]: ")
 	dir, _ := reader.ReadString('\n')
 	dir = strings.TrimSpace(dir)
+	automaticDirectory := dir == ""
 	if dir == "" {
 		created, err := os.MkdirTemp("", "slidebolt-quickstart-")
 		if err != nil {
@@ -342,6 +372,12 @@ func (a App) interactive(ctx context.Context) error {
 		}
 		dir = created
 	}
+	removeAutomaticDirectory := automaticDirectory
+	defer func() {
+		if removeAutomaticDirectory {
+			_ = os.RemoveAll(dir)
+		}
+	}()
 	fmt.Fprintln(a.Out, "Loading released component catalog...")
 	cat, err := catalog.Load(catalog.DefaultURL)
 	if err != nil {
@@ -399,6 +435,11 @@ func (a App) interactive(ctx context.Context) error {
 		}
 	}
 	builder := install.Builder{Root: dir, CatalogURL: catalog.DefaultURL, Catalog: cat, Plugins: plugins, Values: values, Stdout: a.Out}
+	builder.ToolPrompt = func(requirement contract.ToolRequirement) (string, error) {
+		fmt.Fprintf(a.Out, "%s was not found. %s\nPath to %s (blank to stop): ", requirement.Name, requirement.InstallHint, requirement.ID)
+		value, err := reader.ReadString('\n')
+		return strings.TrimSpace(value), err
+	}
 	if err := builder.Build(ctx); err != nil {
 		return err
 	}
@@ -408,6 +449,7 @@ func (a App) interactive(ctx context.Context) error {
 	if err := runtimehost.WaitReady(dir, 45*time.Second); err != nil {
 		return err
 	}
+	removeAutomaticDirectory = false
 	fmt.Fprintf(a.Out, "SlideBolt %s is running in %s\n", cat.Release, dir)
 	for {
 		fmt.Fprint(a.Out, "\n[d]evices [e]ntities [s]cripts schedules [l]ogs [r]untime [q]uit: ")

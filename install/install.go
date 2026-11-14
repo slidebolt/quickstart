@@ -22,6 +22,7 @@ import (
 
 	"github.com/slidebolt/quickstart/catalog"
 	contract "github.com/slidebolt/sb-contract"
+	runtimecontract "github.com/slidebolt/sb-runtime"
 )
 
 const MarkerName = ".slidebolt-quickstart"
@@ -38,6 +39,7 @@ type Configuration struct {
 	Release    string                       `json:"release"`
 	Plugins    []string                     `json:"plugins"`
 	Values     map[string]map[string]string `json:"values"`
+	Tools      map[string]string            `json:"tools,omitempty"`
 }
 
 type Builder struct {
@@ -46,6 +48,8 @@ type Builder struct {
 	Catalog    catalog.Catalog
 	Plugins    []string
 	Values     map[string]map[string]string
+	Tools      map[string]string
+	ToolPrompt func(contract.ToolRequirement) (string, error)
 	Stdout     io.Writer
 }
 
@@ -54,9 +58,6 @@ func Platform() string { return runtime.GOOS + "_" + runtime.GOARCH }
 func (b *Builder) Build(ctx context.Context) (buildErr error) {
 	root, err := filepath.Abs(b.Root)
 	if err != nil {
-		return err
-	}
-	if err := ensureBuildTarget(root); err != nil {
 		return err
 	}
 	platform := Platform()
@@ -68,10 +69,12 @@ func (b *Builder) Build(ctx context.Context) (buildErr error) {
 	if err != nil {
 		return err
 	}
-	for _, component := range selected {
-		if len(component.Setup.Tools) > 0 {
-			return fmt.Errorf("component %s requires external resources; this quickstart release does not yet define their lifecycle", component.ID)
-		}
+	toolEnvironment, resolvedTools, err := b.resolveTools(ctx, selected)
+	if err != nil {
+		return err
+	}
+	if err := ensureBuildTarget(root); err != nil {
+		return err
 	}
 	if err := os.MkdirAll(filepath.Join(root, ".staging", "bin"), 0700); err != nil {
 		return err
@@ -113,11 +116,57 @@ func (b *Builder) Build(ctx context.Context) (buildErr error) {
 	if err := writeJSON(filepath.Join(root, MarkerName), marker, 0600); err != nil {
 		return err
 	}
-	config := Configuration{CatalogURL: b.CatalogURL, Release: b.Catalog.Release, Plugins: append([]string(nil), b.Plugins...), Values: b.Values}
+	config := Configuration{CatalogURL: b.CatalogURL, Release: b.Catalog.Release, Plugins: append([]string(nil), b.Plugins...), Values: b.Values, Tools: resolvedTools}
 	if err := writeJSON(filepath.Join(root, "config", "install.json"), config, 0600); err != nil {
 		return err
 	}
-	return writeRuntimeConfig(root, selected, b.Values)
+	return writeRuntimeConfig(root, selected, b.Values, toolEnvironment)
+}
+
+func (b *Builder) resolveTools(ctx context.Context, components []catalog.Component) (map[string]map[string]string, map[string]string, error) {
+	componentEnvironment := map[string]map[string]string{}
+	resolved := map[string]string{}
+	for _, component := range components {
+		for _, requirement := range component.Setup.Tools {
+			path := resolved[requirement.ID]
+			configured := path
+			if configured == "" {
+				configured = b.Tools[requirement.ID]
+			}
+			check, cancel := context.WithTimeout(ctx, 10*time.Second)
+			result, err := runtimecontract.ResolveTool(check, requirement, configured)
+			cancel()
+			if err != nil && requirement.Required && b.ToolPrompt != nil {
+				provided, promptErr := b.ToolPrompt(requirement)
+				if promptErr != nil {
+					return nil, nil, promptErr
+				}
+				if strings.TrimSpace(provided) != "" {
+					check, cancel = context.WithTimeout(ctx, 10*time.Second)
+					result, err = runtimecontract.ResolveTool(check, requirement, provided)
+					cancel()
+				}
+			}
+			if err != nil {
+				if requirement.Required {
+					return nil, nil, fmt.Errorf("component %s requires %s: %w", component.ID, requirement.ID, err)
+				}
+				continue
+			}
+			path = result.Path
+			resolved[requirement.ID] = path
+			if b.Stdout != nil && configured == "" {
+				fmt.Fprintf(b.Stdout, "verified %s at %s\n", requirement.Name, path)
+			}
+			if requirement.Environment != "" {
+				if componentEnvironment[component.ID] == nil {
+					componentEnvironment[component.ID] = map[string]string{}
+				}
+				componentEnvironment[component.ID][requirement.Environment] = path
+			}
+		}
+	}
+	return componentEnvironment, resolved, nil
 }
 
 func resolve(cat catalog.Catalog, requested []string) ([]catalog.Component, error) {
@@ -163,7 +212,7 @@ func resolve(cat catalog.Catalog, requested []string) ([]catalog.Component, erro
 	return out, nil
 }
 
-func writeRuntimeConfig(root string, components []catalog.Component, values map[string]map[string]string) error {
+func writeRuntimeConfig(root string, components []catalog.Component, values map[string]map[string]string, toolEnvironment map[string]map[string]string) error {
 	type componentConfig struct {
 		Environment map[string]string `json:"environment,omitempty"`
 	}
@@ -172,6 +221,9 @@ func writeRuntimeConfig(root string, components []catalog.Component, values map[
 	}{Components: map[string]componentConfig{}}
 	for _, component := range components {
 		environment := map[string]string{}
+		for key, value := range toolEnvironment[component.ID] {
+			environment[key] = value
+		}
 		resolvedValues := map[string]string{}
 		for _, field := range component.Setup.Fields {
 			value := values[component.ID][field.Key]

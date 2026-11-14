@@ -8,11 +8,11 @@ import (
 	contract "github.com/slidebolt/sb-contract"
 )
 
-func TestValidateRejectsMissingToolResource(t *testing.T) {
+func TestValidateAcceptsSystemTool(t *testing.T) {
 	cat := validCatalog()
-	cat.Components[0].Setup.Tools = []contract.ToolRequirement{{ID: "ffmpeg", Required: true}}
-	if err := cat.Validate(); err == nil || !strings.Contains(err.Error(), "missing resource ffmpeg") {
-		t.Fatalf("Validate() = %v, want missing resource", err)
+	cat.Components[0].Setup.Tools = []contract.ToolRequirement{{ID: "ffmpeg", Name: "FFmpeg", Source: contract.ToolSourceSystem, Kind: contract.ToolKindExecutable, Required: true, Checks: []contract.ToolCheck{{Arguments: []string{"-version"}}}}}
+	if err := cat.Validate(); err != nil {
+		t.Fatalf("Validate() = %v", err)
 	}
 }
 
@@ -29,7 +29,7 @@ func TestValidateAcceptsSerializedSetup(t *testing.T) {
 func validCatalog() Catalog {
 	artifact := Artifact{URL: "https://example.invalid/component", SHA256: strings.Repeat("a", 64)}
 	return Catalog{
-		SchemaVersion: 1,
+		SchemaVersion: 2,
 		Release:       "v1.0.0",
 		Manager:       map[string]Artifact{"linux_amd64": artifact},
 		Components: []Component{{

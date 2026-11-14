@@ -35,7 +35,7 @@ func TestBuildResolvesComponentsWritesEnvironmentAndDestroys(t *testing.T) {
 	defer server.Close()
 
 	cat := catalog.Catalog{
-		SchemaVersion: 1, Release: "v1.2.3",
+		SchemaVersion: 2, Release: "v1.2.3",
 		Manager: map[string]catalog.Artifact{platform: artifact(server.URL+"/manager", manager)},
 		Components: []catalog.Component{{
 			ID: "core", Version: "v1.0.0", Kind: contract.KindService, Setup: setup,
@@ -70,13 +70,62 @@ func TestBuildCleansStagingAfterChecksumFailure(t *testing.T) {
 	server := artifactServer(t, map[string][]byte{"/manager": []byte("bad")})
 	defer server.Close()
 	root := filepath.Join(t.TempDir(), "sandbox")
-	cat := catalog.Catalog{SchemaVersion: 1, Release: "v1", Manager: map[string]catalog.Artifact{platform: {URL: server.URL + "/manager", SHA256: strings.Repeat("0", 64)}}}
+	cat := catalog.Catalog{SchemaVersion: 2, Release: "v1", Manager: map[string]catalog.Artifact{platform: {URL: server.URL + "/manager", SHA256: strings.Repeat("0", 64)}}}
 	err := (&Builder{Root: root, Catalog: cat}).Build(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
 		t.Fatalf("Build() = %v, want checksum mismatch", err)
 	}
 	if _, statErr := os.Stat(filepath.Join(root, ".staging")); !os.IsNotExist(statErr) {
 		t.Fatalf("staging remains after failed build: %v", statErr)
+	}
+}
+
+func TestBuildValidatesAndInjectsSystemTool(t *testing.T) {
+	platform := Platform()
+	tool := filepath.Join(t.TempDir(), "video-tool")
+	if err := os.WriteFile(tool, []byte("#!/bin/sh\nprintf 'video-tool ready\\n'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	setup := contract.SetupDefinition{Mode: contract.SetupRequired, Category: "Core", Tools: []contract.ToolRequirement{{
+		ID: "video-tool", Name: "Video tool", Source: contract.ToolSourceSystem, Kind: contract.ToolKindExecutable,
+		Environment: "VIDEO_TOOL_PATH", Required: true, Checks: []contract.ToolCheck{{Arguments: []string{"-version"}, Contains: []string{"ready"}}},
+	}}}
+	hello := contract.HelloResponse{ID: "media", Kind: contract.KindService, ContractVersion: contract.ContractVersion, Setup: &setup}
+	rawHello, _ := json.Marshal(hello)
+	component := []byte("#!/bin/sh\nprintf '%s\\n' '" + string(rawHello) + "'\n")
+	manager := []byte("#!/bin/sh\nexit 0\n")
+	server := artifactServer(t, map[string][]byte{"/component": component, "/manager": manager})
+	defer server.Close()
+	cat := catalog.Catalog{SchemaVersion: 2, Release: "v1", Manager: map[string]catalog.Artifact{platform: artifact(server.URL+"/manager", manager)}, Components: []catalog.Component{{ID: "media", Version: "v1", Kind: contract.KindService, Setup: setup, Artifacts: map[string]catalog.Artifact{platform: artifact(server.URL+"/component", component)}}}}
+	root := filepath.Join(t.TempDir(), "sandbox")
+	builder := Builder{Root: root, Catalog: cat, Tools: map[string]string{"video-tool": tool}}
+	if err := builder.Build(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(root, "config", "runtime.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"VIDEO_TOOL_PATH": "`+tool+`"`) {
+		t.Fatalf("runtime config does not contain tool path:\n%s", raw)
+	}
+}
+
+func TestBuildMissingToolDoesNotCreateTarget(t *testing.T) {
+	platform := Platform()
+	setup := contract.SetupDefinition{Mode: contract.SetupRequired, Category: "Core", Tools: []contract.ToolRequirement{{
+		ID: "definitely-missing-tool", Name: "Missing tool", Source: contract.ToolSourceSystem, Kind: contract.ToolKindExecutable,
+		Required: true, InstallHint: "Install the missing package.", Checks: []contract.ToolCheck{{Arguments: []string{"-version"}}},
+	}}}
+	artifact := catalog.Artifact{URL: "https://example.invalid/unused", SHA256: strings.Repeat("a", 64)}
+	cat := catalog.Catalog{SchemaVersion: 2, Release: "v1", Manager: map[string]catalog.Artifact{platform: artifact}, Components: []catalog.Component{{ID: "media", Version: "v1", Kind: contract.KindService, Setup: setup, Artifacts: map[string]catalog.Artifact{platform: artifact}}}}
+	root := filepath.Join(t.TempDir(), "must-not-exist")
+	err := (&Builder{Root: root, Catalog: cat}).Build(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "Install the missing package") {
+		t.Fatalf("Build() = %v", err)
+	}
+	if _, statErr := os.Stat(root); !os.IsNotExist(statErr) {
+		t.Fatalf("build target was created before preflight: %v", statErr)
 	}
 }
 
