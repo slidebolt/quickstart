@@ -136,6 +136,37 @@ func TestDestroyRejectsUnownedDirectory(t *testing.T) {
 	}
 }
 
+func TestResolveAddsHiddenDependencyOnlyWhenPluginNeedsIt(t *testing.T) {
+	cat := catalog.Catalog{Components: []catalog.Component{
+		{ID: "core", Setup: contract.SetupDefinition{Mode: contract.SetupRequired}},
+		{ID: "media", Setup: contract.SetupDefinition{Mode: contract.SetupDependency}},
+		{ID: "plugin-tv", DependsOn: []string{"core", "media"}, Setup: contract.SetupDefinition{Mode: contract.SetupSelectable}},
+		{ID: "plugin-light", DependsOn: []string{"core"}, Setup: contract.SetupDefinition{Mode: contract.SetupSelectable}},
+	}}
+	components, err := resolve(cat, []string{"plugin-light"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids := componentIDs(components); strings.Contains(ids, "media") {
+		t.Fatalf("unneeded media dependency resolved: %s", ids)
+	}
+	components, err = resolve(cat, []string{"plugin-tv"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids := componentIDs(components); !strings.Contains(ids, "media") {
+		t.Fatalf("media dependency missing: %s", ids)
+	}
+}
+
+func componentIDs(components []catalog.Component) string {
+	ids := make([]string, 0, len(components))
+	for _, component := range components {
+		ids = append(ids, component.ID)
+	}
+	return strings.Join(ids, ",")
+}
+
 func TestDefaultValue(t *testing.T) {
 	for _, tc := range []struct{ raw, export, want string }{
 		{`true`, "", "true"}, {`42`, "", "42"}, {`["a","b"]`, "csv", "a,b"},
