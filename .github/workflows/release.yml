@@ -31,7 +31,7 @@ jobs:
         run: |
           mkdir -p dist
           go build -ldflags "-X github.com/slidebolt/quickstart/app.Version=${GITHUB_REF_NAME}" -o "dist/slidebolt_${GOOS}_${GOARCH}" ./cmd/slidebolt
-          sha256sum "dist/slidebolt_${GOOS}_${GOARCH}" > "dist/slidebolt_${GOOS}_${GOARCH}.sha256"
+          (cd dist && sha256sum "slidebolt_${GOOS}_${GOARCH}" > "slidebolt_${GOOS}_${GOARCH}.sha256")
       - uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/v')
         with:
