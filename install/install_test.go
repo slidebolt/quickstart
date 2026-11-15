@@ -159,6 +159,27 @@ func TestResolveAddsHiddenDependencyOnlyWhenPluginNeedsIt(t *testing.T) {
 	}
 }
 
+func TestResolveAddsNestedAsteriskSpeechDependencies(t *testing.T) {
+	cat := catalog.Catalog{Components: []catalog.Component{
+		{ID: "messenger", Setup: contract.SetupDefinition{Mode: contract.SetupRequired}},
+		{ID: "storage", DependsOn: []string{"messenger"}, Setup: contract.SetupDefinition{Mode: contract.SetupRequired}},
+		{ID: "media", DependsOn: []string{"messenger"}, Setup: contract.SetupDefinition{Mode: contract.SetupDependency}},
+		{ID: "speech", DependsOn: []string{"messenger"}, Setup: contract.SetupDefinition{Mode: contract.SetupDependency}},
+		{ID: "asterisk-host", DependsOn: []string{"messenger", "media", "speech"}, Setup: contract.SetupDefinition{Mode: contract.SetupDependency}},
+		{ID: "plugin-asterisk", DependsOn: []string{"messenger", "storage", "asterisk-host"}, Setup: contract.SetupDefinition{Mode: contract.SetupSelectable}},
+	}}
+	components, err := resolve(cat, []string{"plugin-asterisk"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := componentIDs(components)
+	for _, want := range []string{"asterisk-host", "media", "speech", "plugin-asterisk"} {
+		if !strings.Contains(ids, want) {
+			t.Fatalf("%s missing from resolved components: %s", want, ids)
+		}
+	}
+}
+
 func componentIDs(components []catalog.Component) string {
 	ids := make([]string, 0, len(components))
 	for _, component := range components {
