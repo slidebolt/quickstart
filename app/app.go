@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,6 +47,10 @@ func (a App) Run(ctx context.Context, args []string) int {
 		return 0
 	case "build":
 		err = a.build(ctx, args[1:])
+	case "configure":
+		err = a.configure(ctx, args[1:])
+	case "upgrade":
+		err = a.upgrade(ctx, args[1:])
 	case "run":
 		err = a.runForeground(ctx, args[1:])
 	case "start":
@@ -77,7 +82,7 @@ func (a App) Run(ctx context.Context, args []string) int {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprintln(w, "usage: slidebolt [build|run|start|stop|status|destroy|devices|entities|command|scripts|schedules|logs|definitions|runtime|api|version]")
+	fmt.Fprintln(w, "usage: slidebolt [build|configure|upgrade|run|start|stop|status|destroy|devices|entities|command|scripts|schedules|logs|definitions|runtime|api|version]")
 }
 
 type repeated []string
@@ -135,6 +140,169 @@ func (a App) build(ctx context.Context, args []string) error {
 	return nil
 }
 
+func (a App) configure(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("configure", flag.ContinueOnError)
+	fs.SetOutput(a.Err)
+	dirValue := fs.String("dir", "", "installation directory")
+	catalogURL := fs.String("catalog", "", "catalog override (normally the installed release)")
+	var addPlugins, removePlugins, settings, unset, valueFiles, tools repeated
+	fs.Var(&addPlugins, "plugin", "selectable plugin ID to add (repeatable)")
+	fs.Var(&removePlugins, "remove-plugin", "selectable plugin ID to remove (repeatable)")
+	fs.Var(&settings, "set", "component.field=value (repeatable; secrets are rejected)")
+	fs.Var(&unset, "unset", "component.field to restore to its catalog default")
+	fs.Var(&valueFiles, "set-file", "component.field=/path (required for secret values)")
+	fs.Var(&tools, "tool", "system tool override, id=/absolute/path (repeatable)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	root, err := resolveDir(*dirValue)
+	if err != nil {
+		return err
+	}
+	if err := requireStopped(root); err != nil {
+		return err
+	}
+	current, err := install.LoadConfiguration(root)
+	if err != nil {
+		return err
+	}
+	source := *catalogURL
+	if source == "" {
+		source = current.CatalogURL
+		if source == "" || source == catalog.DefaultURL {
+			source = catalog.ReleaseURL(current.Release)
+		}
+	}
+	cat, err := catalog.Load(source)
+	if err != nil {
+		return err
+	}
+	if cat.Release != current.Release {
+		return fmt.Errorf("configure cannot change releases (%s to %s); use upgrade", current.Release, cat.Release)
+	}
+	plugins, err := mergePlugins(cat, current.Plugins, addPlugins, removePlugins)
+	if err != nil {
+		return err
+	}
+	values := cloneSettings(current.Values)
+	parsed, err := parseSettings(cat, settings)
+	if err != nil {
+		return err
+	}
+	mergeSettings(values, parsed)
+	if err := unsetSettings(cat, values, unset); err != nil {
+		return err
+	}
+	files, err := parseValueFiles(cat, valueFiles)
+	if err != nil {
+		return err
+	}
+	mergeSettings(values, files)
+	resolvedTools := cloneStrings(current.Tools)
+	toolOverrides, err := parseToolOverrides(tools)
+	if err != nil {
+		return err
+	}
+	for id, path := range toolOverrides {
+		resolvedTools[id] = path
+	}
+	builder := install.Builder{Root: root, CatalogURL: source, Catalog: cat, Plugins: plugins, Values: values, Tools: resolvedTools, Stdout: a.Out}
+	if err := builder.Update(ctx); err != nil {
+		return err
+	}
+	fmt.Fprintf(a.Out, "configured %s in %s\n", cat.Release, root)
+	return nil
+}
+
+func (a App) upgrade(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("upgrade", flag.ContinueOnError)
+	fs.SetOutput(a.Err)
+	dirValue := fs.String("dir", "", "installation directory")
+	release := fs.String("release", "", "target release tag, for example v1.0.38")
+	catalogURL := fs.String("catalog", "", "exact target catalog URL or local path")
+	allowDowngrade := fs.Bool("allow-downgrade", false, "explicitly allow installing an older release")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if (*release == "") == (*catalogURL == "") {
+		return fmt.Errorf("upgrade requires exactly one of --release or --catalog")
+	}
+	root, err := resolveDir(*dirValue)
+	if err != nil {
+		return err
+	}
+	if err := requireStopped(root); err != nil {
+		return err
+	}
+	current, err := install.LoadConfiguration(root)
+	if err != nil {
+		return err
+	}
+	source := *catalogURL
+	if source == "" {
+		source = catalog.ReleaseURL(*release)
+	}
+	cat, err := catalog.Load(source)
+	if err != nil {
+		return err
+	}
+	if *release != "" && cat.Release != *release {
+		return fmt.Errorf("catalog release %s does not match requested %s", cat.Release, *release)
+	}
+	if cat.Release == current.Release {
+		fmt.Fprintf(a.Out, "already running release %s\n", current.Release)
+		return nil
+	}
+	order, err := compareReleases(cat.Release, current.Release)
+	if err != nil {
+		return err
+	}
+	if order < 0 && !*allowDowngrade {
+		return fmt.Errorf("refusing downgrade from %s to %s without --allow-downgrade", current.Release, cat.Release)
+	}
+	builder := install.Builder{Root: root, CatalogURL: source, Catalog: cat, Plugins: current.Plugins, Values: current.Values, Tools: current.Tools, Stdout: a.Out}
+	if err := builder.Update(ctx); err != nil {
+		return err
+	}
+	fmt.Fprintf(a.Out, "upgraded %s to %s in %s\n", current.Release, cat.Release, root)
+	return nil
+}
+
+func compareReleases(left, right string) (int, error) {
+	parse := func(value string) ([3]int, error) {
+		var result [3]int
+		parts := strings.Split(strings.TrimPrefix(value, "v"), ".")
+		if len(parts) != len(result) {
+			return result, fmt.Errorf("release %q is not a stable semantic version", value)
+		}
+		for i, part := range parts {
+			parsed, err := strconv.Atoi(part)
+			if err != nil || parsed < 0 {
+				return result, fmt.Errorf("release %q is not a stable semantic version", value)
+			}
+			result[i] = parsed
+		}
+		return result, nil
+	}
+	a, err := parse(left)
+	if err != nil {
+		return 0, err
+	}
+	b, err := parse(right)
+	if err != nil {
+		return 0, err
+	}
+	for i := range a {
+		if a[i] < b[i] {
+			return -1, nil
+		}
+		if a[i] > b[i] {
+			return 1, nil
+		}
+	}
+	return 0, nil
+}
+
 func parseToolOverrides(raw []string) (map[string]string, error) {
 	result := map[string]string{}
 	for _, item := range raw {
@@ -182,6 +350,136 @@ func parseSettings(cat catalog.Catalog, raw []string) (map[string]map[string]str
 		values[componentID][fieldKey] = value
 	}
 	return values, nil
+}
+
+func parseValueFiles(cat catalog.Catalog, raw []string) (map[string]map[string]string, error) {
+	values := map[string]map[string]string{}
+	for _, item := range raw {
+		left, path, ok := strings.Cut(item, "=")
+		componentID, fieldKey, split := strings.Cut(left, ".")
+		if !ok || !split || strings.TrimSpace(path) == "" {
+			return nil, fmt.Errorf("invalid --set-file %q; want component.field=/path", item)
+		}
+		field, err := setupField(cat, componentID, fieldKey)
+		if err != nil {
+			return nil, err
+		}
+		if !field.Sensitive {
+			return nil, fmt.Errorf("%s.%s is not sensitive; use --set", componentID, fieldKey)
+		}
+		file, err := os.Open(strings.TrimSpace(path))
+		if err != nil {
+			return nil, fmt.Errorf("%s.%s: %w", componentID, fieldKey, err)
+		}
+		rawValue, readErr := io.ReadAll(io.LimitReader(file, 1<<20))
+		closeErr := file.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		value := strings.TrimSuffix(strings.TrimSuffix(string(rawValue), "\n"), "\r")
+		if values[componentID] == nil {
+			values[componentID] = map[string]string{}
+		}
+		values[componentID][fieldKey] = value
+	}
+	return values, nil
+}
+
+func setupField(cat catalog.Catalog, componentID, fieldKey string) (*contract.SetupField, error) {
+	component, found := cat.Component(componentID)
+	if !found {
+		return nil, fmt.Errorf("unknown component %q", componentID)
+	}
+	for i := range component.Setup.Fields {
+		if component.Setup.Fields[i].Key == fieldKey {
+			return &component.Setup.Fields[i], nil
+		}
+	}
+	return nil, fmt.Errorf("unknown setting %s.%s", componentID, fieldKey)
+}
+
+func cloneSettings(source map[string]map[string]string) map[string]map[string]string {
+	result := map[string]map[string]string{}
+	mergeSettings(result, source)
+	return result
+}
+
+func mergeSettings(destination, source map[string]map[string]string) {
+	for component, fields := range source {
+		if destination[component] == nil {
+			destination[component] = map[string]string{}
+		}
+		for key, value := range fields {
+			destination[component][key] = value
+		}
+	}
+}
+
+func cloneStrings(source map[string]string) map[string]string {
+	result := map[string]string{}
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
+func unsetSettings(cat catalog.Catalog, values map[string]map[string]string, raw []string) error {
+	for _, item := range raw {
+		componentID, fieldKey, ok := strings.Cut(item, ".")
+		if !ok {
+			return fmt.Errorf("invalid --unset %q; want component.field", item)
+		}
+		field, err := setupField(cat, componentID, fieldKey)
+		if err != nil {
+			return err
+		}
+		if field.Generate != "" {
+			return fmt.Errorf("%s.%s is generated and cannot be unset during a safe reconfiguration", componentID, fieldKey)
+		}
+		delete(values[componentID], fieldKey)
+	}
+	return nil
+}
+
+func mergePlugins(cat catalog.Catalog, current, additions, removals []string) ([]string, error) {
+	selected := map[string]bool{}
+	for _, id := range current {
+		selected[id] = true
+	}
+	for _, id := range additions {
+		component, ok := cat.Component(id)
+		if !ok || component.Setup.Mode != contract.SetupSelectable {
+			return nil, fmt.Errorf("unknown selectable plugin %q", id)
+		}
+		selected[id] = true
+	}
+	for _, id := range removals {
+		component, ok := cat.Component(id)
+		if !ok || component.Setup.Mode != contract.SetupSelectable {
+			return nil, fmt.Errorf("unknown selectable plugin %q", id)
+		}
+		delete(selected, id)
+	}
+	result := make([]string, 0, len(selected))
+	for id := range selected {
+		result = append(result, id)
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+func requireStopped(root string) error {
+	running, pid, err := runtimehost.IsRunning(root)
+	if err != nil {
+		return err
+	}
+	if running {
+		return fmt.Errorf("quickstart is running with pid %d; stop it before changing the installation", pid)
+	}
+	return nil
 }
 
 func (a App) runForeground(ctx context.Context, args []string) error {

@@ -21,8 +21,26 @@ slidebolt status --dir ./demo
 slidebolt devices --dir ./demo
 slidebolt command --dir ./demo --entity plugin.device.entity --action switch_turn_on
 slidebolt stop --dir ./demo
+slidebolt configure --dir ./demo --plugin plugin-plex
+slidebolt upgrade --dir ./demo --release v1.0.38
 slidebolt destroy --dir ./demo
 ```
+
+`configure` changes the selected plugins and their serialized settings without
+changing the installed release. Use `--remove-plugin`, `--set`, or `--unset` as
+needed. Sensitive values are read from a protected file so they do not appear
+in shell history or process arguments:
+
+```bash
+slidebolt configure --dir ./demo --plugin plugin-example \
+  --set-file plugin-example.token=/run/user/1000/plugin-token
+```
+
+`upgrade` requires an explicit release tag or exact catalog path. It downloads
+and verifies the complete target installation before swapping any live file.
+The installation identity, generated values, API token, data, and logs are
+preserved. Downgrades require the explicit `--allow-downgrade` flag. Both
+commands require the sandbox to be stopped.
 
 Components may declare system-owned executable or file requirements. Quickstart
 checks the resolved dependency graph before writing the installation and never

@@ -133,6 +133,21 @@ func LoadState(root string) (State, error) {
 	return state, err
 }
 
+func IsRunning(root string) (bool, int, error) {
+	state, err := LoadState(root)
+	if os.IsNotExist(err) {
+		return false, 0, nil
+	}
+	if err != nil {
+		return false, 0, err
+	}
+	if !processAlive(state.PID) {
+		_ = os.Remove(filepath.Join(root, "run", "state.json"))
+		return false, state.PID, nil
+	}
+	return true, state.PID, nil
+}
+
 func WaitReady(root string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	var lastProblem string

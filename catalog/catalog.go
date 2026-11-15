@@ -14,6 +14,10 @@ import (
 
 const DefaultURL = "https://github.com/slidebolt/release/releases/latest/download/quickstart-catalog.json"
 
+func ReleaseURL(release string) string {
+	return "https://github.com/slidebolt/release/releases/download/" + release + "/quickstart-catalog.json"
+}
+
 type Artifact struct {
 	URL    string `json:"url"`
 	SHA256 string `json:"sha256"`

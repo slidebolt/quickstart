@@ -80,6 +80,111 @@ func TestBuildCleansStagingAfterChecksumFailure(t *testing.T) {
 	}
 }
 
+func TestUpdatePreservesIdentityGeneratedValuesAndRuntimeData(t *testing.T) {
+	platform := Platform()
+	setup := contract.SetupDefinition{Mode: contract.SetupRequired, Category: "Core", Fields: []contract.SetupField{{
+		Key: "token", Environment: "CORE_TOKEN", Name: "Token", Control: contract.SetupSecret, Sensitive: true, Generate: "secret", Required: true,
+	}}}
+	componentV1 := helloExecutable(t, "core", contract.KindService, setup, "v1")
+	componentV2 := helloExecutable(t, "core", contract.KindService, setup, "v2")
+	managerV1 := []byte("#!/bin/sh\n# manager-v1\nexit 0\n")
+	managerV2 := []byte("#!/bin/sh\n# manager-v2\nexit 0\n")
+	server := artifactServer(t, map[string][]byte{
+		"/component-v1": componentV1, "/component-v2": componentV2,
+		"/manager-v1": managerV1, "/manager-v2": managerV2,
+	})
+	defer server.Close()
+	makeCatalog := func(release, suffix string, componentBytes, managerBytes []byte) catalog.Catalog {
+		return catalog.Catalog{
+			SchemaVersion: 2, Release: release,
+			Manager:    map[string]catalog.Artifact{platform: artifact(server.URL+"/manager-"+suffix, managerBytes)},
+			Components: []catalog.Component{{ID: "core", Version: release, Kind: contract.KindService, Setup: setup, Artifacts: map[string]catalog.Artifact{platform: artifact(server.URL+"/component-"+suffix, componentBytes)}}},
+		}
+	}
+	root := filepath.Join(t.TempDir(), "sandbox")
+	v1 := makeCatalog("v1", "v1", componentV1, managerV1)
+	if err := (&Builder{Root: root, CatalogURL: "catalog-v1", Catalog: v1}).Build(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	beforeMarkerRaw, _ := os.ReadFile(filepath.Join(root, MarkerName))
+	var beforeMarker Marker
+	_ = json.Unmarshal(beforeMarkerRaw, &beforeMarker)
+	before, err := LoadConfiguration(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeToken := before.Values["core"]["token"]
+	if beforeToken == "" {
+		t.Fatal("generated token was not persisted")
+	}
+	if err := os.WriteFile(filepath.Join(root, "data", "kept"), []byte("data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "config", "api-token"), []byte("api-secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	v2 := makeCatalog("v2", "v2", componentV2, managerV2)
+	if err := (&Builder{Root: root, CatalogURL: "catalog-v2", Catalog: v2, Values: before.Values}).Update(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	after, err := LoadConfiguration(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Release != "v2" || after.Values["core"]["token"] != beforeToken {
+		t.Fatalf("configuration after update = %#v", after)
+	}
+	_, afterMarker, err := ValidateOwnedRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterMarker.ID != beforeMarker.ID || afterMarker.Release != "v2" {
+		t.Fatalf("marker after update = %#v; before = %#v", afterMarker, beforeMarker)
+	}
+	for path, want := range map[string]string{
+		filepath.Join(root, "data", "kept"):        "data",
+		filepath.Join(root, "config", "api-token"): "api-secret",
+	} {
+		got, err := os.ReadFile(path)
+		if err != nil || string(got) != want {
+			t.Fatalf("preserved file %s = %q, %v", path, got, err)
+		}
+	}
+	manager, _ := os.ReadFile(filepath.Join(root, "sb-manager"))
+	if !strings.Contains(string(manager), "manager-v2") {
+		t.Fatalf("manager was not upgraded:\n%s", manager)
+	}
+}
+
+func TestFailedUpdateLeavesInstalledReleaseUntouched(t *testing.T) {
+	platform := Platform()
+	setup := contract.SetupDefinition{Mode: contract.SetupRequired, Category: "Core"}
+	component := helloExecutable(t, "core", contract.KindService, setup, "component")
+	manager := []byte("#!/bin/sh\n# original-manager\nexit 0\n")
+	server := artifactServer(t, map[string][]byte{"/component": component, "/manager": manager, "/bad-manager": []byte("bad")})
+	defer server.Close()
+	v1 := catalog.Catalog{SchemaVersion: 2, Release: "v1", Manager: map[string]catalog.Artifact{platform: artifact(server.URL+"/manager", manager)}, Components: []catalog.Component{{ID: "core", Version: "v1", Kind: contract.KindService, Setup: setup, Artifacts: map[string]catalog.Artifact{platform: artifact(server.URL+"/component", component)}}}}
+	root := filepath.Join(t.TempDir(), "sandbox")
+	if err := (&Builder{Root: root, Catalog: v1}).Build(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	v2 := v1
+	v2.Release = "v2"
+	v2.Manager = map[string]catalog.Artifact{platform: {URL: server.URL + "/bad-manager", SHA256: strings.Repeat("0", 64)}}
+	err := (&Builder{Root: root, Catalog: v2}).Update(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Fatalf("Update() = %v, want checksum mismatch", err)
+	}
+	configuration, loadErr := LoadConfiguration(root)
+	if loadErr != nil || configuration.Release != "v1" {
+		t.Fatalf("installed configuration = %#v, %v", configuration, loadErr)
+	}
+	installed, _ := os.ReadFile(filepath.Join(root, "sb-manager"))
+	if !strings.Contains(string(installed), "original-manager") {
+		t.Fatalf("installed manager changed after failed update:\n%s", installed)
+	}
+}
+
 func TestBuildValidatesAndInjectsSystemTool(t *testing.T) {
 	platform := Platform()
 	tool := filepath.Join(t.TempDir(), "video-tool")
@@ -214,6 +319,16 @@ func artifactServer(t *testing.T, files map[string][]byte) *httptest.Server {
 func artifact(url string, data []byte) catalog.Artifact {
 	sum := sha256.Sum256(data)
 	return catalog.Artifact{URL: url, SHA256: hex.EncodeToString(sum[:])}
+}
+
+func helloExecutable(t *testing.T, id, kind string, setup contract.SetupDefinition, label string) []byte {
+	t.Helper()
+	hello := contract.HelloResponse{ID: id, Kind: kind, ContractVersion: contract.ContractVersion, Setup: &setup}
+	raw, err := json.Marshal(hello)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return []byte("#!/bin/sh\n# " + label + "\nprintf '%s\\n' '" + string(raw) + "'\n")
 }
 
 func TestPlatformIsLinuxInReleaseVerification(t *testing.T) {

@@ -53,6 +53,18 @@ type Builder struct {
 	Stdout     io.Writer
 }
 
+// Update replaces an owned, stopped installation with the selected catalog
+// release. Runtime data, logs, API credentials, and the installation identity
+// are preserved. Every artifact and configuration file is staged and verified
+// before the first installed path is changed.
+func (b *Builder) Update(ctx context.Context) error {
+	root, marker, err := ValidateOwnedRoot(b.Root)
+	if err != nil {
+		return err
+	}
+	return b.install(ctx, root, marker)
+}
+
 func Platform() string { return runtime.GOOS + "_" + runtime.GOARCH }
 
 func (b *Builder) Build(ctx context.Context) (buildErr error) {
@@ -60,6 +72,17 @@ func (b *Builder) Build(ctx context.Context) (buildErr error) {
 	if err != nil {
 		return err
 	}
+	if err := ensureBuildTarget(root); err != nil {
+		return err
+	}
+	marker := Marker{Magic: markerMagic, ID: randomHex(16), Release: b.Catalog.Release}
+	if err := b.install(ctx, root, marker); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (b *Builder) install(ctx context.Context, root string, marker Marker) (installErr error) {
 	platform := Platform()
 	manager, ok := b.Catalog.Manager[platform]
 	if !ok {
@@ -73,16 +96,18 @@ func (b *Builder) Build(ctx context.Context) (buildErr error) {
 	if err != nil {
 		return err
 	}
-	if err := ensureBuildTarget(root); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Join(root, ".staging", "bin"), 0700); err != nil {
-		return err
-	}
 	stage := filepath.Join(root, ".staging")
+	if _, err := os.Lstat(stage); err == nil {
+		return fmt.Errorf("staging path already exists: %s", stage)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Join(stage, "bin"), 0700); err != nil {
+		return err
+	}
 	defer func() {
-		if err := os.RemoveAll(stage); buildErr == nil && err != nil {
-			buildErr = err
+		if err := os.RemoveAll(stage); installErr == nil && err != nil {
+			installErr = err
 		}
 	}()
 	if err := download(ctx, manager, filepath.Join(stage, "sb-manager")); err != nil {
@@ -106,21 +131,23 @@ func (b *Builder) Build(ctx context.Context) (buildErr error) {
 			return err
 		}
 	}
-	if err := replacePath(filepath.Join(stage, "bin"), filepath.Join(root, "bin")); err != nil {
+	values := cloneValues(b.Values)
+	if err := preserveGeneratedValues(root, selected, values); err != nil {
 		return err
 	}
-	if err := replacePath(filepath.Join(stage, "sb-manager"), filepath.Join(root, "sb-manager")); err != nil {
+	resolvedValues, err := writeRuntimeConfig(root, filepath.Join(stage, "runtime.json"), selected, values, toolEnvironment)
+	if err != nil {
 		return err
 	}
-	marker := Marker{Magic: markerMagic, ID: randomHex(16), Release: b.Catalog.Release}
-	if err := writeJSON(filepath.Join(root, MarkerName), marker, 0600); err != nil {
+	marker.Release = b.Catalog.Release
+	if err := writeJSON(filepath.Join(stage, MarkerName), marker, 0600); err != nil {
 		return err
 	}
-	config := Configuration{CatalogURL: b.CatalogURL, Release: b.Catalog.Release, Plugins: append([]string(nil), b.Plugins...), Values: b.Values, Tools: resolvedTools}
-	if err := writeJSON(filepath.Join(root, "config", "install.json"), config, 0600); err != nil {
+	config := Configuration{CatalogURL: b.CatalogURL, Release: b.Catalog.Release, Plugins: append([]string(nil), b.Plugins...), Values: resolvedValues, Tools: resolvedTools}
+	if err := writeJSON(filepath.Join(stage, "install.json"), config, 0600); err != nil {
 		return err
 	}
-	return writeRuntimeConfig(root, selected, b.Values, toolEnvironment)
+	return commitInstallation(root, stage)
 }
 
 func (b *Builder) resolveTools(ctx context.Context, components []catalog.Component) (map[string]map[string]string, map[string]string, error) {
@@ -212,13 +239,14 @@ func resolve(cat catalog.Catalog, requested []string) ([]catalog.Component, erro
 	return out, nil
 }
 
-func writeRuntimeConfig(root string, components []catalog.Component, values map[string]map[string]string, toolEnvironment map[string]map[string]string) error {
+func writeRuntimeConfig(root, destination string, components []catalog.Component, values map[string]map[string]string, toolEnvironment map[string]map[string]string) (map[string]map[string]string, error) {
 	type componentConfig struct {
 		Environment map[string]string `json:"environment,omitempty"`
 	}
 	document := struct {
 		Components map[string]componentConfig `json:"components"`
 	}{Components: map[string]componentConfig{}}
+	resolvedDocumentValues := map[string]map[string]string{}
 	for _, component := range components {
 		environment := map[string]string{}
 		for key, value := range toolEnvironment[component.ID] {
@@ -234,25 +262,26 @@ func writeRuntimeConfig(root string, components []catalog.Component, values map[
 				var err error
 				value, err = defaultValue(field.Default, field.Export)
 				if err != nil {
-					return fmt.Errorf("%s.%s default: %w", component.ID, field.Key, err)
+					return nil, fmt.Errorf("%s.%s default: %w", component.ID, field.Key, err)
 				}
 			}
 			if field.RelativeTo == "sandbox" && value != "" && !filepath.IsAbs(value) {
 				value = filepath.Join(root, filepath.Clean(value))
 			}
 			if field.Required && value == "" {
-				return fmt.Errorf("%s.%s is required", component.ID, field.Key)
+				return nil, fmt.Errorf("%s.%s is required", component.ID, field.Key)
 			}
+			resolvedValues[field.Key] = value
+			exportedValue := value
 			if field.Export == "file_contents" && value != "" {
 				raw, err := os.ReadFile(value)
 				if err != nil {
-					return fmt.Errorf("%s.%s: %w", component.ID, field.Key, err)
+					return nil, fmt.Errorf("%s.%s: %w", component.ID, field.Key, err)
 				}
-				value = string(raw)
+				exportedValue = string(raw)
 			}
-			resolvedValues[field.Key] = value
-			if field.Environment != "" && value != "" {
-				environment[field.Environment] = value
+			if field.Environment != "" && exportedValue != "" {
+				environment[field.Environment] = exportedValue
 			}
 		}
 		for _, constraint := range component.Setup.Constraints {
@@ -266,12 +295,16 @@ func writeRuntimeConfig(root string, components []catalog.Component, values map[
 				}
 			}
 			if set != 0 && set != len(constraint.Fields) {
-				return fmt.Errorf("%s settings %s must be provided together", component.ID, strings.Join(constraint.Fields, ", "))
+				return nil, fmt.Errorf("%s settings %s must be provided together", component.ID, strings.Join(constraint.Fields, ", "))
 			}
 		}
+		resolvedDocumentValues[component.ID] = resolvedValues
 		document.Components[component.ID] = componentConfig{Environment: environment}
 	}
-	return writeJSON(filepath.Join(root, "config", "runtime.json"), document, 0600)
+	if err := writeJSON(destination, document, 0600); err != nil {
+		return nil, err
+	}
+	return resolvedDocumentValues, nil
 }
 
 func defaultValue(raw json.RawMessage, export string) (string, error) {
@@ -330,6 +363,112 @@ func generated(kind string) string {
 	default:
 		return ""
 	}
+}
+
+func cloneValues(source map[string]map[string]string) map[string]map[string]string {
+	result := map[string]map[string]string{}
+	for component, fields := range source {
+		result[component] = map[string]string{}
+		for key, value := range fields {
+			result[component][key] = value
+		}
+	}
+	return result
+}
+
+// preserveGeneratedValues supports installations created before resolved setup
+// values were persisted in install.json. Only generated fields are recovered;
+// declared values already stored in install.json always take precedence.
+func preserveGeneratedValues(root string, components []catalog.Component, values map[string]map[string]string) error {
+	raw, err := os.ReadFile(filepath.Join(root, "config", "runtime.json"))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var document struct {
+		Components map[string]struct {
+			Environment map[string]string `json:"environment"`
+		} `json:"components"`
+	}
+	if err := json.Unmarshal(raw, &document); err != nil {
+		return fmt.Errorf("existing runtime configuration: %w", err)
+	}
+	for _, component := range components {
+		for _, field := range component.Setup.Fields {
+			if field.Generate == "" || field.Environment == "" || values[component.ID][field.Key] != "" {
+				continue
+			}
+			value := document.Components[component.ID].Environment[field.Environment]
+			if value == "" {
+				continue
+			}
+			if values[component.ID] == nil {
+				values[component.ID] = map[string]string{}
+			}
+			values[component.ID][field.Key] = value
+		}
+	}
+	return nil
+}
+
+func commitInstallation(root, stage string) (commitErr error) {
+	type replacement struct {
+		stage string
+		live  string
+		name  string
+	}
+	replacements := []replacement{
+		{filepath.Join(stage, "bin"), filepath.Join(root, "bin"), "bin"},
+		{filepath.Join(stage, "sb-manager"), filepath.Join(root, "sb-manager"), "sb-manager"},
+		{filepath.Join(stage, "runtime.json"), filepath.Join(root, "config", "runtime.json"), "runtime.json"},
+		{filepath.Join(stage, "install.json"), filepath.Join(root, "config", "install.json"), "install.json"},
+		{filepath.Join(stage, MarkerName), filepath.Join(root, MarkerName), MarkerName},
+	}
+	backup := filepath.Join(root, ".rollback")
+	if _, err := os.Lstat(backup); err == nil {
+		return fmt.Errorf("rollback path already exists: %s", backup)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Mkdir(backup, 0700); err != nil {
+		return err
+	}
+	defer func() {
+		if err := os.RemoveAll(backup); commitErr == nil && err != nil {
+			commitErr = err
+		}
+	}()
+
+	backedUp := make([]replacement, 0, len(replacements))
+	installed := make([]replacement, 0, len(replacements))
+	rollback := func() {
+		for i := len(installed) - 1; i >= 0; i-- {
+			_ = os.RemoveAll(installed[i].live)
+		}
+		for i := len(backedUp) - 1; i >= 0; i-- {
+			_ = os.Rename(filepath.Join(backup, backedUp[i].name), backedUp[i].live)
+		}
+	}
+	for _, item := range replacements {
+		if _, err := os.Lstat(item.live); err == nil {
+			if err := os.Rename(item.live, filepath.Join(backup, item.name)); err != nil {
+				rollback()
+				return err
+			}
+			backedUp = append(backedUp, item)
+		} else if !os.IsNotExist(err) {
+			rollback()
+			return err
+		}
+		if err := os.Rename(item.stage, item.live); err != nil {
+			rollback()
+			return err
+		}
+		installed = append(installed, item)
+	}
+	return nil
 }
 
 func download(ctx context.Context, artifact catalog.Artifact, destination string) error {
@@ -396,7 +535,7 @@ func ensureBuildTarget(root string) error {
 	}
 	entries, err := os.ReadDir(root)
 	if os.IsNotExist(err) {
-		return os.MkdirAll(root, 0700)
+		return nil
 	}
 	if err != nil {
 		return err
