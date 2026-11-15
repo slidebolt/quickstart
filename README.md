@@ -59,3 +59,12 @@ Secrets are entered through the masked interactive setup. Sandboxes retain
 their data and logs after stopping and are removed only by the guarded
 `destroy` command.
 
+For a fully noninteractive build, pass required secrets through protected
+files instead of command-line values:
+
+```bash
+slidebolt build --dir ./zigbee-demo --plugin plugin-zigbee \
+  --set plugin-zigbee.host_url=http://127.0.0.1:47831 \
+  --set-file plugin-zigbee.host_token=/run/user/1000/zigbee-token
+```
+

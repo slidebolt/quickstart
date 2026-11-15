@@ -98,9 +98,10 @@ func (a App) build(ctx context.Context, args []string) error {
 	fs.SetOutput(a.Err)
 	dir := fs.String("dir", "", "installation directory (default: new temporary directory)")
 	catalogURL := fs.String("catalog", catalog.DefaultURL, "released quickstart catalog URL")
-	var plugins, settings, tools repeated
+	var plugins, settings, valueFiles, tools repeated
 	fs.Var(&plugins, "plugin", "selectable plugin ID (repeatable)")
 	fs.Var(&settings, "set", "component.field=value (repeatable; secrets are rejected)")
+	fs.Var(&valueFiles, "set-file", "component.field=/path (required for secret values)")
 	fs.Var(&tools, "tool", "system tool override, id=/absolute/path (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -127,6 +128,11 @@ func (a App) build(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	files, err := parseValueFiles(cat, valueFiles)
+	if err != nil {
+		return err
+	}
+	mergeSettings(values, files)
 	toolOverrides, err := parseToolOverrides(tools)
 	if err != nil {
 		return err

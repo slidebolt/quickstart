@@ -49,6 +49,15 @@ func TestParseValueFilesAcceptsSensitiveValueWithoutPuttingItInArguments(t *test
 	}
 }
 
+func TestBuildAcceptsSetFileFlag(t *testing.T) {
+	var output bytes.Buffer
+	application := App{Out: &output, Err: &output}
+	code := application.Run(context.Background(), []string{"build", "--catalog", filepath.Join(t.TempDir(), "missing-catalog"), "--set-file", "plugin-example.token=/tmp/token"})
+	if code != 1 || strings.Contains(output.String(), "flag provided but not defined") {
+		t.Fatalf("build code=%d output=%q", code, output.String())
+	}
+}
+
 func TestUpgradeRequiresPinnedTarget(t *testing.T) {
 	var output bytes.Buffer
 	application := App{Out: &output, Err: &output}
