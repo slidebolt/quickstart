@@ -35,6 +35,17 @@ func TestReadinessRejectsRestartedComponent(t *testing.T) {
 	}
 }
 
+func TestReadinessRejectsDegradedResourceComponent(t *testing.T) {
+	root := t.TempDir()
+	writeRuntimeFixture(t, root, `{"components":{"plugin-example":{}}}`)
+	state, closeServer := statusServer(t, `[{"id":"plugin-example","state":"degraded","restartCount":0,"lastError":"resource example-api is unavailable"}]`)
+	defer closeServer()
+	problem, err := readinessProblem(root, state)
+	if err != nil || !strings.Contains(problem, "resource example-api is unavailable") {
+		t.Fatalf("readinessProblem() = %q, %v", problem, err)
+	}
+}
+
 func writeRuntimeFixture(t *testing.T, root, document string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Join(root, "config"), 0700); err != nil {

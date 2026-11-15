@@ -3,8 +3,8 @@ module github.com/slidebolt/quickstart
 go 1.26.1
 
 require (
-	github.com/slidebolt/sb-contract v1.0.11
-	github.com/slidebolt/sb-runtime v1.0.8
+	github.com/slidebolt/sb-contract v1.0.12
+	github.com/slidebolt/sb-runtime v1.0.9
 	golang.org/x/term v0.48.0
 )
 

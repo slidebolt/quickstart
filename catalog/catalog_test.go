@@ -26,6 +26,18 @@ func TestValidateAcceptsSerializedSetup(t *testing.T) {
 	}
 }
 
+func TestValidateAcceptsExternalResources(t *testing.T) {
+	cat := validCatalog()
+	cat.Components[0].Setup.Fields = []contract.SetupField{{Key: "endpoint", Environment: "EXAMPLE_ENDPOINT", Name: "Endpoint", Control: contract.SetupText}}
+	cat.Components[0].Setup.Resources = []contract.ExternalResourceDefinition{{
+		ID: "example-api", Kind: contract.ExternalResourceService, Name: "Example API", Description: "Supplies example data.",
+		Fields: []string{"endpoint"}, Activation: contract.ResourceActivation{Mode: contract.ResourceActivationConfigured, Fields: []string{"endpoint"}},
+	}}
+	if err := cat.Validate(); err != nil {
+		t.Fatalf("Validate() = %v", err)
+	}
+}
+
 func validCatalog() Catalog {
 	artifact := Artifact{URL: "https://example.invalid/component", SHA256: strings.Repeat("a", 64)}
 	return Catalog{
